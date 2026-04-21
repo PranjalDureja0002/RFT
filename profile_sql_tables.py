@@ -2,12 +2,11 @@
 SQL Server Table Profiler
 =========================
 Connects to SQL Server, profiles the specified tables, and generates
-knowledge YAML files ready for the Talk-to-Data pipeline:
+knowledge YAML files consumed by 0_knowledge_processor.py:
 
-  - schema_columns_<view>.yaml   — column metadata, types, cardinality
-  - column_values_<view>.yaml    — distinct values (top N) per column
-  - data_context_<view>.yaml     — table-level stats, date ranges, row counts
-  - examples_<view>.yaml         — sample rows as example records
+  - schema_columns_<tag>.yaml  — column metadata (dict keyed by column name)
+  - column_values_<tag>.yaml   — distinct values per column
+  - data_context_<tag>.yaml    — table-level stats, date ranges, row counts
 
 Usage:
     python profile_sql_tables.py \
@@ -20,7 +19,6 @@ Usage:
         --tables   "VW_DIRECT_SPEND_ALL,VW_INDIRECT_SPEND_ALL" \
         --output-dir "./knowledge_profiled" \
         [--top-values 20]        # number of distinct values to sample
-        [--sample-rows 15]       # number of example rows to fetch
 
 Prerequisites:
     pip install pyodbc pyyaml python-dotenv
@@ -40,6 +38,22 @@ import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Mandatory row-level filter applied to every profiling query.
+# Keep profiling aligned with the pipeline's business cut-off.
+# Set MANDATORY_FILTER = "" to disable.
+MANDATORY_FILTER = "INVOICE_DATE >= '2024-04-01'"
+
+
+def _where(extra: str | None = None) -> str:
+    """Build a WHERE clause combining MANDATORY_FILTER with an optional extra predicate."""
+    parts = []
+    if MANDATORY_FILTER:
+        parts.append(MANDATORY_FILTER)
+    if extra:
+        parts.append(f"({extra})")
+    return ("WHERE " + " AND ".join(parts)) if parts else ""
+
 
 # ──────────────────────────────────────────────────────────────────────
 # YAML setup — preserve key order, clean output
@@ -112,7 +126,7 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
     columns_meta = cur.fetchall()
 
     # Get total row count
-    cur.execute(f"SELECT COUNT(*) FROM [{schema}].[{table}]")
+    cur.execute(f"SELECT COUNT(*) FROM [{schema}].[{table}] {_where()}")
     total_rows = cur.fetchone()[0]
 
     columns = []
@@ -144,6 +158,7 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
                     COUNT(DISTINCT {safe_col}) AS distinct_count,
                     SUM(CASE WHEN {safe_col} IS NULL THEN 1 ELSE 0 END) AS null_count
                 FROM [{schema}].[{table}]
+                {_where()}
             """)
             row = cur.fetchone()
             col_info["cardinality"] = row[0]
@@ -162,6 +177,7 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
                 cur.execute(f"""
                     SELECT MIN({safe_col}), MAX({safe_col})
                     FROM [{schema}].[{table}]
+                    {_where()}
                 """)
                 min_val, max_val = cur.fetchone()
                 col_info["min_value"] = _safe_value(min_val)
@@ -174,7 +190,7 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
             cur.execute(f"""
                 SELECT TOP {top_values} {safe_col} AS val, COUNT(*) AS cnt
                 FROM [{schema}].[{table}]
-                WHERE {safe_col} IS NOT NULL
+                {_where(f"{safe_col} IS NOT NULL")}
                 GROUP BY {safe_col}
                 ORDER BY cnt DESC
             """)
@@ -224,7 +240,7 @@ def profile_column_values(cur, schema: str, table: str,
                 cur.execute(f"""
                     SELECT DISTINCT {safe_col}
                     FROM [{schema}].[{table}]
-                    WHERE {safe_col} IS NOT NULL
+                    {_where(f"{safe_col} IS NOT NULL")}
                     ORDER BY {safe_col}
                 """)
                 vals = [_safe_value(r[0]) for r in cur.fetchall()]
@@ -288,6 +304,7 @@ def profile_data_context(cur, schema: str, table: str,
                     SELECT MIN({safe_col}), MAX({safe_col}),
                            COUNT(DISTINCT {safe_col})
                     FROM [{schema}].[{table}]
+                    {_where()}
                 """)
                 mn, mx, dist = cur.fetchone()
                 date_ranges[dc] = OrderedDict([
@@ -317,6 +334,7 @@ def profile_data_context(cur, schema: str, table: str,
                         SUM(CAST({safe_col} AS FLOAT))  AS sum_val,
                         STDEV({safe_col})               AS stddev_val
                     FROM [{schema}].[{table}]
+                    {_where()}
                 """)
                 row = cur.fetchone()
                 numeric_stats[nc] = OrderedDict([
@@ -353,6 +371,7 @@ def profile_data_context(cur, schema: str, table: str,
                 SELECT MAX([{main_date}]),
                        DATEDIFF(DAY, MAX([{main_date}]), GETDATE())
                 FROM [{schema}].[{table}]
+                {_where()}
             """)
             latest, days_old = cur.fetchone()
             context["data_freshness"] = OrderedDict([
@@ -364,34 +383,6 @@ def profile_data_context(cur, schema: str, table: str,
             pass
 
     return context
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 4. Example Rows
-# ──��───────────────────────────────────────────────────────────────────
-
-def profile_examples(cur, schema: str, table: str,
-                     sample_rows: int) -> list[dict]:
-    """Fetch N sample rows as example records."""
-    try:
-        cur.execute(f"""
-            SELECT TOP {sample_rows} *
-            FROM [{schema}].[{table}]
-            ORDER BY NEWID()
-        """)
-        columns = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()
-
-        examples = []
-        for row in rows:
-            record = OrderedDict()
-            for col_name, val in zip(columns, row):
-                record[col_name] = _safe_value(val)
-            examples.append(record)
-        return examples
-    except Exception as e:
-        print(f"    WARNING: Could not fetch example rows: {e}")
-        return []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -433,8 +424,6 @@ def main():
                         help="Output directory for YAML files")
     parser.add_argument("--top-values", type=int, default=20,
                         help="Number of top distinct values to sample per column (default: 20)")
-    parser.add_argument("--sample-rows", type=int, default=15,
-                        help="Number of example rows to fetch (default: 15)")
     args = parser.parse_args()
 
     if not args.server or not args.database:
@@ -462,22 +451,44 @@ def main():
             tag = short_name.replace("vw_", "").replace(" ", "_")
 
         # ── 1. Schema Columns ──
-        print(f"\n  [1/4] Schema & column profiling (top {args.top_values} values per column)...")
+        # Output as dict-of-dicts (keyed by column name) to match the shape
+        # expected by 0_knowledge_processor._build_column_metadata, which iterates
+        # columns.items(). Top-level "table_name" also matches the processor's
+        # content-based slot detector.
+        print(f"\n  [1/3] Schema & column profiling (top {args.top_values} values per column)...")
         start = time.time()
         schema_profile = profile_schema(cur, args.schema, table, args.top_values)
         elapsed = time.time() - start
         print(f"  Schema profiling done in {elapsed:.1f}s — {schema_profile['column_count']} columns, {schema_profile['total_rows']:,} rows")
 
+        columns_dict = OrderedDict()
+        for col in schema_profile["columns"]:
+            name = col["name"]
+            entry = OrderedDict([
+                ("type", col["data_type"]),
+                ("display_type", col["display_type"]),
+                ("nullable", col["nullable"]),
+                ("cardinality", col.get("cardinality")),
+                ("null_count", col.get("null_count")),
+                ("null_pct", col.get("null_pct")),
+            ])
+            if "min_value" in col:
+                entry["min_value"] = col["min_value"]
+            if "max_value" in col:
+                entry["max_value"] = col["max_value"]
+            entry["top_values"] = col.get("top_values", [])
+            columns_dict[name] = entry
+
         schema_yaml = OrderedDict([
-            ("view_name", f"{args.schema.upper()}.{table}"),
+            ("table_name", f"{args.schema.upper()}.{table}"),
             ("total_rows", schema_profile["total_rows"]),
             ("column_count", schema_profile["column_count"]),
-            ("columns", schema_profile["columns"]),
+            ("columns", columns_dict),
         ])
         write_yaml(dict(schema_yaml), output_dir / f"schema_columns_{tag}.yaml")
 
         # ── 2. Column Values ──
-        print(f"\n  [2/4] Column values profiling...")
+        print(f"\n  [2/3] Column values profiling...")
         start = time.time()
         col_values = profile_column_values(
             cur, args.schema, table, schema_profile,
@@ -486,15 +497,26 @@ def main():
         elapsed = time.time() - start
         print(f"  Column values done in {elapsed:.1f}s — {len(col_values)} columns catalogued")
 
+        # Normalize each column entry to use "examples" (what the processor prefers)
+        # instead of "values", flatten type/cardinality info into the shape
+        # _build_column_values already handles. Top-level key is "column_values".
+        col_values_normalized = OrderedDict()
+        for col_name, info in col_values.items():
+            col_values_normalized[col_name] = OrderedDict([
+                ("cardinality", info.get("cardinality")),
+                ("examples", info.get("values", [])),
+                ("complete", info.get("type") == "exhaustive"),
+            ])
+
         col_values_yaml = OrderedDict([
-            ("view_name", f"{args.schema.upper()}.{table}"),
+            ("table_name", f"{args.schema.upper()}.{table}"),
             ("description", f"Distinct column values for {table}"),
-            ("columns", col_values),
+            ("column_values", col_values_normalized),
         ])
         write_yaml(dict(col_values_yaml), output_dir / f"column_values_{tag}.yaml")
 
         # ── 3. Data Context ──
-        print(f"\n  [3/4] Data context profiling...")
+        print(f"\n  [3/3] Data context profiling...")
         start = time.time()
         data_ctx = profile_data_context(cur, args.schema, table, schema_profile)
         elapsed = time.time() - start
@@ -502,32 +524,16 @@ def main():
 
         write_yaml(dict(data_ctx), output_dir / f"data_context_{tag}.yaml")
 
-        # ── 4. Example Rows ──
-        print(f"\n  [4/4] Fetching {args.sample_rows} example rows...")
-        start = time.time()
-        examples = profile_examples(cur, args.schema, table, args.sample_rows)
-        elapsed = time.time() - start
-        print(f"  Examples done in {elapsed:.1f}s — {len(examples)} rows")
-
-        examples_yaml = OrderedDict([
-            ("view_name", f"{args.schema.upper()}.{table}"),
-            ("description", f"Random sample rows from {table}"),
-            ("sample_count", len(examples)),
-            ("rows", examples),
-        ])
-        write_yaml(dict(examples_yaml), output_dir / f"sample_rows_{tag}.yaml")
-
     cur.close()
     conn.close()
 
     print(f"\n{'='*60}")
     print(f"All done! Output files in: {output_dir}")
     print(f"{'='*60}")
-    print(f"\nGenerated files per table:")
-    print(f"  schema_columns_<tag>.yaml  — column metadata, types, cardinality, top values")
+    print(f"\nGenerated files per table (all compatible with 0_knowledge_processor.py):")
+    print(f"  schema_columns_<tag>.yaml  — column metadata (dict-of-dicts, keyed by column name)")
     print(f"  column_values_<tag>.yaml   — distinct values (exhaustive for low cardinality)")
     print(f"  data_context_<tag>.yaml    — table stats, date ranges, numeric aggregates")
-    print(f"  sample_rows_<tag>.yaml     — {args.sample_rows} random example rows")
 
 
 if __name__ == "__main__":
