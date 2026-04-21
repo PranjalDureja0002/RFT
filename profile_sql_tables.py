@@ -90,7 +90,13 @@ def _safe_value(val):
 # ──────────────────────────────────────────────────────────────────────
 
 def connect(args) -> pyodbc.Connection:
-    """Build a pyodbc connection to SQL Server."""
+    """Build a pyodbc connection to SQL Server.
+
+    Aligns session SET options with SSMS/DBeaver defaults so the server
+    picks the same cached execution plan. Without SET ARITHABORT ON,
+    pyodbc gets a separate (often worse) plan for identical SQL —
+    the classic "fast in DBeaver, slow in app" cause.
+    """
     conn_str = (
         f"DRIVER={{ODBC Driver 17 for SQL Server}};"
         f"SERVER={args.server},{args.port};"
@@ -102,6 +108,14 @@ def connect(args) -> pyodbc.Connection:
     )
     print(f"Connecting to {args.server}:{args.port}/{args.database} ...")
     conn = pyodbc.connect(conn_str, timeout=30)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SET ARITHABORT ON")
+    cur.execute("SET ANSI_NULLS ON")
+    cur.execute("SET ANSI_WARNINGS ON")
+    cur.execute("SET CONCAT_NULL_YIELDS_NULL ON")
+    cur.execute("SET QUOTED_IDENTIFIER ON")
+    cur.close()
     print("Connected.\n")
     return conn
 
@@ -441,14 +455,20 @@ def main():
         print(f"Profiling: [{args.schema}].[{table}]")
         print(f"{'='*60}")
 
-        # Determine short name for file naming
+        # Determine tag. "indirect" must be checked first — "direct" is a
+        # substring of "indirect", so the naive order would tag VW_INDIRECT_*
+        # as "direct" and overwrite the VW_DIRECT_* output.
         short_name = table.lower()
-        if "direct" in short_name:
-            tag = "direct"
-        elif "indirect" in short_name:
+        if "indirect" in short_name:
             tag = "indirect"
+        elif "direct" in short_name:
+            tag = "direct"
         else:
             tag = short_name.replace("vw_", "").replace(" ", "_")
+
+        # Each tag writes into its own subfolder (direct/, indirect/) so
+        # the output layout mirrors knowledge_refined/{direct,indirect}/.
+        target_dir = output_dir / tag if tag in ("direct", "indirect") else output_dir
 
         # ── 1. Schema Columns ──
         # Output as dict-of-dicts (keyed by column name) to match the shape
@@ -485,7 +505,7 @@ def main():
             ("column_count", schema_profile["column_count"]),
             ("columns", columns_dict),
         ])
-        write_yaml(dict(schema_yaml), output_dir / f"schema_columns_{tag}.yaml")
+        write_yaml(dict(schema_yaml), target_dir / f"schema_columns_{tag}.yaml")
 
         # ── 2. Column Values ──
         print(f"\n  [2/3] Column values profiling...")
@@ -513,7 +533,7 @@ def main():
             ("description", f"Distinct column values for {table}"),
             ("column_values", col_values_normalized),
         ])
-        write_yaml(dict(col_values_yaml), output_dir / f"column_values_{tag}.yaml")
+        write_yaml(dict(col_values_yaml), target_dir / f"column_values_{tag}.yaml")
 
         # ── 3. Data Context ──
         print(f"\n  [3/3] Data context profiling...")
@@ -522,7 +542,7 @@ def main():
         elapsed = time.time() - start
         print(f"  Data context done in {elapsed:.1f}s")
 
-        write_yaml(dict(data_ctx), output_dir / f"data_context_{tag}.yaml")
+        write_yaml(dict(data_ctx), target_dir / f"data_context_{tag}.yaml")
 
     cur.close()
     conn.close()
