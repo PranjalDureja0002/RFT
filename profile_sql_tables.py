@@ -45,11 +45,18 @@ load_dotenv()
 MANDATORY_FILTER = "INVOICE_DATE >= '2024-04-01'"
 
 
-def _where(extra: str | None = None) -> str:
-    """Build a WHERE clause combining MANDATORY_FILTER with an optional extra predicate."""
+def _where(extra: str | None = None, base_filter: str | None = None) -> str:
+    """Build a WHERE clause.
+
+    base_filter=None  -> use MANDATORY_FILTER
+    base_filter=""    -> skip the mandatory filter (e.g. when querying a
+                         temp table that is already filtered).
+    base_filter="..." -> use that literal predicate.
+    """
     parts = []
-    if MANDATORY_FILTER:
-        parts.append(MANDATORY_FILTER)
+    filt = MANDATORY_FILTER if base_filter is None else base_filter
+    if filt:
+        parts.append(filt)
     if extra:
         parts.append(f"({extra})")
     return ("WHERE " + " AND ".join(parts)) if parts else ""
@@ -124,12 +131,22 @@ def connect(args) -> pyodbc.Connection:
 # 1. Schema Columns Profiler
 # ──────────────────────────────────────────────────────────────────────
 
-def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
+def profile_schema(cur, schema: str, table: str, top_values: int,
+                   source_sql: str | None = None,
+                   filter_clause: str | None = None) -> dict:
     """
     For each column: name, type, nullable, cardinality, min, max,
     null_count, null_pct, and top N distinct values.
+
+    source_sql    — FROM fragment to query (default: [schema].[table]).
+                    Pass a temp table name (e.g. "[#spend]") to bypass the
+                    view and profile pre-materialized data.
+    filter_clause — override MANDATORY_FILTER; pass "" when the source_sql
+                    is already filtered (avoids redundant WHERE evaluation).
     """
-    # Get column metadata from INFORMATION_SCHEMA
+    if source_sql is None:
+        source_sql = f"[{schema}].[{table}]"
+    # INFORMATION_SCHEMA lookup always uses the original view name
     cur.execute("""
         SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
                NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
@@ -140,7 +157,7 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
     columns_meta = cur.fetchall()
 
     # Get total row count
-    cur.execute(f"SELECT COUNT(*) FROM [{schema}].[{table}] {_where()}")
+    cur.execute(f"SELECT COUNT(*) FROM {source_sql} {_where(base_filter=filter_clause)}")
     total_rows = cur.fetchone()[0]
 
     columns = []
@@ -171,8 +188,8 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
                 SELECT
                     COUNT(DISTINCT {safe_col}) AS distinct_count,
                     SUM(CASE WHEN {safe_col} IS NULL THEN 1 ELSE 0 END) AS null_count
-                FROM [{schema}].[{table}]
-                {_where()}
+                FROM {source_sql}
+                {_where(base_filter=filter_clause)}
             """)
             row = cur.fetchone()
             col_info["cardinality"] = row[0]
@@ -190,8 +207,8 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
             try:
                 cur.execute(f"""
                     SELECT MIN({safe_col}), MAX({safe_col})
-                    FROM [{schema}].[{table}]
-                    {_where()}
+                    FROM {source_sql}
+                    {_where(base_filter=filter_clause)}
                 """)
                 min_val, max_val = cur.fetchone()
                 col_info["min_value"] = _safe_value(min_val)
@@ -203,8 +220,8 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
         try:
             cur.execute(f"""
                 SELECT TOP {top_values} {safe_col} AS val, COUNT(*) AS cnt
-                FROM [{schema}].[{table}]
-                {_where(f"{safe_col} IS NOT NULL")}
+                FROM {source_sql}
+                {_where(f"{safe_col} IS NOT NULL", base_filter=filter_clause)}
                 GROUP BY {safe_col}
                 ORDER BY cnt DESC
             """)
@@ -233,11 +250,17 @@ def profile_schema(cur, schema: str, table: str, top_values: int) -> dict:
 
 def profile_column_values(cur, schema: str, table: str,
                           schema_profile: dict, max_distinct: int = 200,
-                          top_values: int = 20) -> dict:
+                          top_values: int = 20,
+                          source_sql: str | None = None,
+                          filter_clause: str | None = None) -> dict:
     """
     For columns with cardinality <= max_distinct, fetch ALL distinct values.
     For high-cardinality columns, just the top N by frequency.
+
+    See profile_schema for source_sql / filter_clause semantics.
     """
+    if source_sql is None:
+        source_sql = f"[{schema}].[{table}]"
     columns = {}
     for col in schema_profile["columns"]:
         col_name = col["name"]
@@ -253,8 +276,8 @@ def profile_column_values(cur, schema: str, table: str,
             try:
                 cur.execute(f"""
                     SELECT DISTINCT {safe_col}
-                    FROM [{schema}].[{table}]
-                    {_where(f"{safe_col} IS NOT NULL")}
+                    FROM {source_sql}
+                    {_where(f"{safe_col} IS NOT NULL", base_filter=filter_clause)}
                     ORDER BY {safe_col}
                 """)
                 vals = [_safe_value(r[0]) for r in cur.fetchall()]
@@ -283,11 +306,17 @@ def profile_column_values(cur, schema: str, table: str,
 # ──────────────────────────────────────────────────────────────────────
 
 def profile_data_context(cur, schema: str, table: str,
-                         schema_profile: dict) -> dict:
+                         schema_profile: dict,
+                         source_sql: str | None = None,
+                         filter_clause: str | None = None) -> dict:
     """
     Build a high-level data context: row counts, date ranges,
     key numeric aggregates, data freshness.
+
+    See profile_schema for source_sql / filter_clause semantics.
     """
+    if source_sql is None:
+        source_sql = f"[{schema}].[{table}]"
     total_rows = schema_profile["total_rows"]
     context = OrderedDict()
     context["view_name"] = f"{schema}.{table}"
@@ -317,8 +346,8 @@ def profile_data_context(cur, schema: str, table: str,
                 cur.execute(f"""
                     SELECT MIN({safe_col}), MAX({safe_col}),
                            COUNT(DISTINCT {safe_col})
-                    FROM [{schema}].[{table}]
-                    {_where()}
+                    FROM {source_sql}
+                    {_where(base_filter=filter_clause)}
                 """)
                 mn, mx, dist = cur.fetchone()
                 date_ranges[dc] = OrderedDict([
@@ -347,8 +376,8 @@ def profile_data_context(cur, schema: str, table: str,
                         AVG(CAST({safe_col} AS FLOAT))  AS avg_val,
                         SUM(CAST({safe_col} AS FLOAT))  AS sum_val,
                         STDEV({safe_col})               AS stddev_val
-                    FROM [{schema}].[{table}]
-                    {_where()}
+                    FROM {source_sql}
+                    {_where(base_filter=filter_clause)}
                 """)
                 row = cur.fetchone()
                 numeric_stats[nc] = OrderedDict([
@@ -384,8 +413,8 @@ def profile_data_context(cur, schema: str, table: str,
             cur.execute(f"""
                 SELECT MAX([{main_date}]),
                        DATEDIFF(DAY, MAX([{main_date}]), GETDATE())
-                FROM [{schema}].[{table}]
-                {_where()}
+                FROM {source_sql}
+                {_where(base_filter=filter_clause)}
             """)
             latest, days_old = cur.fetchone()
             context["data_freshness"] = OrderedDict([
@@ -470,6 +499,20 @@ def main():
         # the output layout mirrors knowledge_refined/{direct,indirect}/.
         target_dir = output_dir / tag if tag in ("direct", "indirect") else output_dir
 
+        # Materialize the filtered view into a temp table ONCE, then profile
+        # against that. Without this, every per-column query (200+ per table)
+        # re-scans the complex view and re-applies the WHERE filter — extremely
+        # slow because the predicate doesn't push down through view joins.
+        temp_name = "#spend_profile"
+        cur.execute(f"IF OBJECT_ID('tempdb..{temp_name}') IS NOT NULL DROP TABLE {temp_name}")
+        print(f"\n  Materializing filtered data into {temp_name} (one-time scan)...")
+        start = time.time()
+        cur.execute(f"SELECT * INTO {temp_name} FROM [{args.schema}].[{table}] {_where()}")
+        mat_elapsed = time.time() - start
+        print(f"  Materialized in {mat_elapsed:.1f}s")
+
+        src = f"[{temp_name}]"
+
         # ── 1. Schema Columns ──
         # Output as dict-of-dicts (keyed by column name) to match the shape
         # expected by 0_knowledge_processor._build_column_metadata, which iterates
@@ -477,7 +520,10 @@ def main():
         # content-based slot detector.
         print(f"\n  [1/3] Schema & column profiling (top {args.top_values} values per column)...")
         start = time.time()
-        schema_profile = profile_schema(cur, args.schema, table, args.top_values)
+        schema_profile = profile_schema(
+            cur, args.schema, table, args.top_values,
+            source_sql=src, filter_clause="",
+        )
         elapsed = time.time() - start
         print(f"  Schema profiling done in {elapsed:.1f}s — {schema_profile['column_count']} columns, {schema_profile['total_rows']:,} rows")
 
@@ -513,6 +559,7 @@ def main():
         col_values = profile_column_values(
             cur, args.schema, table, schema_profile,
             max_distinct=200, top_values=args.top_values,
+            source_sql=src, filter_clause="",
         )
         elapsed = time.time() - start
         print(f"  Column values done in {elapsed:.1f}s — {len(col_values)} columns catalogued")
@@ -538,11 +585,16 @@ def main():
         # ── 3. Data Context ──
         print(f"\n  [3/3] Data context profiling...")
         start = time.time()
-        data_ctx = profile_data_context(cur, args.schema, table, schema_profile)
+        data_ctx = profile_data_context(
+            cur, args.schema, table, schema_profile,
+            source_sql=src, filter_clause="",
+        )
         elapsed = time.time() - start
         print(f"  Data context done in {elapsed:.1f}s")
 
         write_yaml(dict(data_ctx), target_dir / f"data_context_{tag}.yaml")
+
+        cur.execute(f"IF OBJECT_ID('tempdb..{temp_name}') IS NOT NULL DROP TABLE {temp_name}")
 
     cur.close()
     conn.close()
