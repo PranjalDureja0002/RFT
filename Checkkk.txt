@@ -1,0 +1,46 @@
+_cached_user_email = None
+
+def _resolve_user_email(self):
+    """Look up the logged-in user's email via AgentCore's DatabaseService.
+
+    Uses the platform's own connection pool (get_db_service) so that
+    managed-identity auth, connection pooling, and URL sanitization
+    are all handled correctly — instead of re-parsing DATABASE_URL
+    with psycopg2 directly.
+    """
+    if self._cached_user_email is not None:
+        return self._cached_user_email
+
+    uid = getattr(self, "user_id", None)
+    if not uid:
+        return ""
+
+    try:
+        from uuid import UUID
+        from sqlalchemy.orm import Session
+        from sqlalchemy import create_engine
+        from agentcore.services.deps import get_db_service
+        from agentcore.services.database.models.user.model import User
+
+        db_service = get_db_service()
+        db_url = db_service.database_url
+        # Strip async driver suffix — we need a sync engine here
+        if "+asyncpg" in db_url:
+            db_url = db_url.replace("+asyncpg", "")
+        if "+psycopg" in db_url and "postgresql+psycopg" not in db_url:
+            pass  # already sync-compatible
+
+        engine = create_engine(db_url, pool_pre_ping=True, pool_size=2)
+        with Session(engine) as session:
+            row = session.get(User, UUID(str(uid)))
+            email = row.email if row and row.email else ""
+
+        self._cached_user_email = email
+        return email
+
+    except Exception as e:
+        try:
+            self.log(f"user email auto-resolve failed: {e}")
+        except Exception:
+            pass
+        return ""
