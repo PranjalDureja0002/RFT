@@ -152,6 +152,109 @@ def validate_yaml(content: str, filename: str) -> bool:
         return False
 
 
+# Only chunk files whose biggest top-level list has at least this many items.
+# Below this, the LLM handles the whole file in one shot without truncation.
+CHUNK_THRESHOLD = 30
+# Items per LLM call. Kept small because each example can expand (descriptions,
+# multi-line SQL) and the model output ceiling is ~16k tokens.
+CHUNK_SIZE = 20
+
+
+def _find_big_list_key(data) -> str | None:
+    """Return the top-level key whose value is the largest list, if that list
+    is long enough to risk output truncation. Otherwise return None."""
+    if not isinstance(data, dict):
+        return None
+    best_key, best_len = None, 0
+    for k, v in data.items():
+        if isinstance(v, list) and len(v) > best_len:
+            best_key, best_len = k, len(v)
+    return best_key if best_len >= CHUNK_THRESHOLD else None
+
+
+def _dump_yaml(obj) -> str:
+    return yaml.safe_dump(
+        obj, sort_keys=False, allow_unicode=True,
+        default_flow_style=False, width=10000,
+    )
+
+
+def convert_yaml(llm: AzureChatOpenAI, content: str, filename: str) -> str:
+    """Dispatch: one-shot for small files, chunked+merged for list-heavy files.
+
+    For files like examples.yaml with 100+ entries the LLM's output cap causes
+    silent truncation ("continue with rest examples"). We parse the YAML, split
+    the big list into CHUNK_SIZE-item batches, convert the header and each
+    batch independently, then merge the results back into a single YAML dict.
+    """
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return convert_file(llm, content, filename)
+
+    big_key = _find_big_list_key(data)
+    if big_key is None:
+        return convert_file(llm, content, filename)
+
+    items = data[big_key]
+    total = len(items)
+    num_chunks = (total + CHUNK_SIZE - 1) // CHUNK_SIZE
+    print(f"  Large list detected: '{big_key}' with {total} items — "
+          f"splitting into {num_chunks} chunks of <= {CHUNK_SIZE}")
+
+    # Convert the header (everything except the big list) so description,
+    # metadata, and other top-level keys also get dialect-converted.
+    header = {k: v for k, v in data.items() if k != big_key}
+    if header:
+        header_yaml = _dump_yaml(header)
+        header_converted_text = convert_file(llm, header_yaml, f"{filename} [header]")
+        try:
+            header_final = yaml.safe_load(header_converted_text)
+            if not isinstance(header_final, dict):
+                header_final = header
+        except yaml.YAMLError:
+            print("    WARNING: header chunk returned invalid YAML — falling back to original header")
+            header_final = header
+    else:
+        header_final = {}
+
+    # Convert the big list in chunks. Each chunk is wrapped in
+    # `{big_key: [...]}` so the LLM sees the same structural context.
+    all_converted_items: list = []
+    for i in range(0, total, CHUNK_SIZE):
+        chunk = items[i:i + CHUNK_SIZE]
+        chunk_idx = i // CHUNK_SIZE + 1
+        print(f"    [chunk {chunk_idx}/{num_chunks}] converting items "
+              f"{i + 1}..{i + len(chunk)}")
+        chunk_yaml = _dump_yaml({big_key: chunk})
+        try:
+            chunk_text = convert_file(llm, chunk_yaml, f"{filename} [chunk {chunk_idx}/{num_chunks}]")
+            chunk_data = yaml.safe_load(chunk_text)
+            if (isinstance(chunk_data, dict)
+                    and isinstance(chunk_data.get(big_key), list)):
+                all_converted_items.extend(chunk_data[big_key])
+            else:
+                print(f"      WARNING: chunk {chunk_idx} missing '{big_key}' list — "
+                      f"keeping original items for this chunk")
+                all_converted_items.extend(chunk)
+        except yaml.YAMLError as e:
+            print(f"      WARNING: chunk {chunk_idx} returned invalid YAML ({e}) — "
+                  f"keeping original items")
+            all_converted_items.extend(chunk)
+        except Exception as e:
+            print(f"      WARNING: chunk {chunk_idx} LLM call failed ({e}) — "
+                  f"keeping original items")
+            all_converted_items.extend(chunk)
+
+    if len(all_converted_items) != total:
+        print(f"    WARNING: converted count {len(all_converted_items)} "
+              f"!= original {total} — output will still be written but please verify")
+
+    merged = dict(header_final)
+    merged[big_key] = all_converted_items
+    return _dump_yaml(merged)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # File discovery
 # ──────────────────────────────────────────────────────────────────────
@@ -234,7 +337,7 @@ def main():
 
         try:
             start = time.time()
-            result = convert_file(llm, content, str(rel_path))
+            result = convert_yaml(llm, content, str(rel_path))
             elapsed = time.time() - start
 
             is_valid = validate_yaml(result, str(rel_path))
